@@ -1,6 +1,9 @@
 pub mod allocations;
 pub mod refs;
 
+#[cfg(test)]
+mod test;
+
 use std::arch::asm;
 use std::io::{BufRead, Result};
 use std::fs::File;
@@ -44,15 +47,15 @@ impl GCContext {
     #[inline(never)]
     pub fn collect(&mut self) -> Result<()> {
 
-        // Get the current stack pointer. Make sure to clobber all the other
+        // Get the current base pointer. Make sure to clobber all the other
         // callee-save registers to make sure they make it onto the stack. I
         // don't think we need to account for the redzone since this function is
         // large.
-        let stack_pointer = {
+        let base_pointer = {
             let mut ret: usize;
             unsafe {
                 asm!(
-                    "mov rax, rsp",
+                    "mov rax, rbp",
                     out("rax") ret,
                     out("rcx") _,
                     out("rdx") _,
@@ -77,7 +80,7 @@ impl GCContext {
         let maps = File::open("/proc/self/maps")?;
         let maps_reader = std::io::BufReader::new(maps);
         for map_result in maps_reader.lines() {
-            self.mark_map(&map_result?, stack_pointer);
+            self.mark_map(&map_result?, base_pointer);
         }
 
         // Sweep unmarked allocations. Make sure to actually free the data.
@@ -97,7 +100,8 @@ impl GCContext {
         Ok(())
     }
 
-    fn mark_map(&mut self, map: &str, stack_pointer: usize) {
+    fn mark_map(&mut self, map: &str, base_pointer: usize) {
+        println!("{}", map);
         // Parse the mapping. We just need to know the memory addresses and
         // whether this is the stack. The file has a stable format, so if we
         // don't get that just panic.
@@ -127,9 +131,9 @@ impl GCContext {
         }
 
         // Mark the entire region. If this region is the stack, we only need to
-        // check past the stack pointer.
+        // check past the base pointer.
         let mark_start = if is_stack {
-            std::cmp::max(stack_pointer, map_start)
+            std::cmp::max(base_pointer, map_start)
         } else {
             map_start
         };
@@ -186,6 +190,8 @@ impl GCContext {
             let allocation = allocation_opt.unwrap();
             let was_marked = allocation.marked;
             allocation.marked = true;
+
+            println!("Found {:p} -> {:p}", cur as *const usize, value as *const usize);
 
             // Finally, mark recursively if the allocation wasn't already
             // marked. Note that we have to copy the start and end.
