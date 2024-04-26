@@ -1,5 +1,3 @@
-use std::arch::asm;
-
 use crate::GCContext;
 use crate::refs::GCRef;
 
