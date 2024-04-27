@@ -1,12 +1,13 @@
 pub mod allocations;
 pub mod refs;
 
+mod arch;
+
 #[cfg(test)]
 mod test;
 
-use std::arch::asm;
-use std::io::{BufRead, Result};
 use std::fs::File;
+use std::io::{BufRead, Result};
 
 use crate::allocations::GCAllocation;
 use crate::refs::GCRef;
@@ -41,35 +42,21 @@ impl GCContext {
             start: ptr as usize,
         });
         // Return
-        GCRef{ ptr }
+        GCRef { ptr }
+    }
+
+    pub fn collect(&mut self) -> Result<()> {
+        // Get the current stack pointer. Make sure to clobber all the other
+        // caller-save registers to make sure they make it onto the stack. We
+        // don't need to account for the redzone since we call another function.
+        let stack_pointer = crate::arch::get_stack_pointer();
+        // Call the inner function. This way, we know everything above us won't
+        // be counted.
+        self.collect_inner(stack_pointer)
     }
 
     #[inline(never)]
-    pub fn collect(&mut self) -> Result<()> {
-
-        // Get the current base pointer. Make sure to clobber all the other
-        // callee-save registers to make sure they make it onto the stack. I
-        // don't think we need to account for the redzone since this function is
-        // large.
-        let base_pointer = {
-            let mut ret: usize;
-            unsafe {
-                asm!(
-                    "mov rax, rbp",
-                    out("rax") ret,
-                    out("rcx") _,
-                    out("rdx") _,
-                    out("rsi") _,
-                    out("rdi") _,
-                    out("r8") _,
-                    out("r9") _,
-                    out("r10") _,
-                    out("r11") _,
-                );
-            }
-            ret
-        };
-
+    fn collect_inner(&mut self, stack_pointer: usize) -> Result<()> {
         // Initially, all the allocations are unmarked
         for allocation in self.allocations.iter_mut() {
             allocation.marked = false;
@@ -80,7 +67,7 @@ impl GCContext {
         let maps = File::open("/proc/self/maps")?;
         let maps_reader = std::io::BufReader::new(maps);
         for map_result in maps_reader.lines() {
-            self.mark_map(&map_result?, base_pointer);
+            self.mark_map(&map_result?, stack_pointer);
         }
 
         // Sweep unmarked allocations. Make sure to actually free the data.
@@ -100,7 +87,7 @@ impl GCContext {
         Ok(())
     }
 
-    fn mark_map(&mut self, map: &str, base_pointer: usize) {
+    fn mark_map(&mut self, map: &str, stack_pointer: usize) {
         println!("{}", map);
         // Parse the mapping. We just need to know the memory addresses and
         // whether this is the stack. The file has a stable format, so if we
@@ -118,8 +105,10 @@ impl GCContext {
             // writable and not executable - i.e. it contains data.
             let writable = perms.starts_with("rw-");
             // Check whether this mapping is for the stack. There's a
-            // pseudo-path for this, so check that.
-            let is_stack = map.ends_with("[stack]");
+            // pseudo-path for this, so check that. Additionally, check if the
+            // current stack pointer is within this mapping. This allows tests
+            // to pass since they run on a different stack.
+            let is_stack = map.ends_with("[stack]") || (start <= stack_pointer && stack_pointer < end);
             // Return
             (start, end, writable, is_stack)
         };
@@ -131,9 +120,9 @@ impl GCContext {
         }
 
         // Mark the entire region. If this region is the stack, we only need to
-        // check past the base pointer.
+        // check past the caller's stack pointer.
         let mark_start = if is_stack {
-            std::cmp::max(base_pointer, map_start)
+            std::cmp::max(stack_pointer, map_start)
         } else {
             map_start
         };
@@ -150,10 +139,10 @@ impl GCContext {
         if start >= end {
             return;
         }
-        // Make sure both parameters are aligned to the size of a pointer. We're
-        // on x86_64, so a pointer is eight bytes.
-        let start = ((start + 7) / 8) * 8;
-        let end = (end / 8) * 8;
+        // Make sure both parameters are aligned to the size of a pointer.
+        let psize = crate::arch::get_pointer_size();
+        let start = ((start + psize - 1) / psize) * psize;
+        let end = (end / psize) * psize;
 
         // Iterate over all pointers in the range. Note that the end is
         // exclusive.
@@ -169,9 +158,7 @@ impl GCContext {
             // If this is our first call, ignore pointers from within the
             // allocated chunks.
             if first {
-                let cur_allocation_opt = self.allocations.iter().find(|a| {
-                    a.contains(cur)
-                });
+                let cur_allocation_opt = self.allocations.iter().find(|a| a.contains(cur));
                 if cur_allocation_opt.is_some() {
                     continue;
                 }
@@ -179,9 +166,7 @@ impl GCContext {
 
             // Check to see if the memory location points to any allocation. If
             // it points to no allocation, continue.
-            let allocation_opt = self.allocations.iter_mut().find(|a| {
-                a.contains(value)
-            });
+            let allocation_opt = self.allocations.iter_mut().find(|a| a.contains(value));
             if allocation_opt.is_none() {
                 continue;
             }
@@ -191,7 +176,10 @@ impl GCContext {
             let was_marked = allocation.marked;
             allocation.marked = true;
 
-            println!("Found {:p} -> {:p}", cur as *const usize, value as *const usize);
+            println!(
+                "Found {:p} -> {:p}",
+                cur as *const usize, value as *const usize
+            );
 
             // Finally, mark recursively if the allocation wasn't already
             // marked. Note that we have to copy the start and end.
